@@ -1,0 +1,257 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Sentiment Detective v2 — Bedrock Mantle Edition
+  Runs entirely on AWS. EC2 does the work. No local machine needed.
+  S3 -> Lambda -> Bedrock Mantle (Gemma 3 4B) -> DynamoDB -> SNS alerts
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: sentiment-detective
+
+  AlertEmail:
+    Type: String
+    Description: Your email for alerts (negative/urgent reviews)
+
+  BedrockRegion:
+    Type: String
+    Default: us-east-1
+    Description: Must match region where your Bedrock Mantle project lives
+
+Resources:
+
+  # ── S3 — Drop your review .txt files here ──────────────────
+  ContentBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: LambdaInvokePermission
+    Properties:
+      BucketName: !Sub "${ProjectName}-content-${AWS::AccountId}"
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: ".txt"
+            Function: !GetAtt SentimentLambda.Arn
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ── DynamoDB — Stores all results ──────────────────────────
+  ResultsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-results"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+        - AttributeName: sentiment
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: sentiment-index
+          KeySchema:
+            - AttributeName: sentiment
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  # ── SNS — Email alerts for bad reviews ─────────────────────
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-alerts"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  # ── IAM Role — Lambda permissions ──────────────────────────
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SentimentPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource: !Sub "arn:aws:s3:::${ProjectName}-content-${AWS::AccountId}/*"
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:Query, dynamodb:Scan]
+                Resource:
+                  - !GetAtt ResultsTable.Arn
+                  - !Sub "${ResultsTable.Arn}/index/*"
+              - Effect: Allow
+                Action: [bedrock:InvokeModel, bedrock:Converse]
+                Resource: "*"
+              - Effect: Allow
+                Action: [sns:Publish]
+                Resource: !Ref AlertTopic
+
+  # ── Lambda — The Brain (uses Bedrock Mantle endpoint) ──────
+  SentimentLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-analyzer"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      MemorySize: 256
+      Timeout: 60
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref ResultsTable
+          SNS_TOPIC_ARN: !Ref AlertTopic
+          BEDROCK_REGION: !Ref BedrockRegion
+          # Bedrock Mantle model ID for Gemma 3 4B (cheapest, fast)
+          MODEL_ID: "google.gemma-3-4b-it"
+          # Bedrock Mantle endpoint
+          BEDROCK_ENDPOINT: !Sub "https://bedrock-mantle.${BedrockRegion}.api.aws/v1"
+      Code:
+        ZipFile: |
+          import json, boto3, os, uuid
+          from datetime import datetime, timezone
+
+          s3 = boto3.client("s3")
+          dynamo = boto3.resource("dynamodb")
+          sns = boto3.client("sns")
+
+          TABLE = os.environ["DYNAMODB_TABLE"]
+          SNS_ARN = os.environ["SNS_TOPIC_ARN"]
+          REGION = os.environ["BEDROCK_REGION"]
+          MODEL = os.environ["MODEL_ID"]
+
+          # Use Bedrock Converse API — works with Mantle models
+          bedrock = boto3.client("bedrock-runtime", region_name=REGION)
+
+          PROMPT = """Analyze this customer review. Reply ONLY with valid JSON, nothing else.
+
+          Review: {content}
+
+          Return exactly this:
+          {{"sentiment":"positive/neutral/negative","sentiment_score":<-1.0 to 1.0>,"key_topics":["topic1","topic2"],"urgency_level":"low/medium/high/critical","summary":"one sentence","action_required":true/false}}"""
+
+          def lambda_handler(event, context):
+              for record in event.get("Records", []):
+                  bucket = record["s3"]["bucket"]["name"]
+                  key = record["s3"]["object"]["key"]
+                  try:
+                      content = s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8").strip()
+                      if not content:
+                          continue
+                      # Call Bedrock using Converse API (works with Mantle)
+                      resp = bedrock.converse(
+                          modelId=MODEL,
+                          messages=[{"role":"user","content":[{"text": PROMPT.format(content=content)}]}],
+                          inferenceConfig={"maxTokens":512,"temperature":0.1}
+                      )
+                      raw = resp["output"]["message"]["content"][0]["text"].strip()
+                      # Strip markdown if model wraps in ```json
+                      if raw.startswith("```"):
+                          raw = raw.split("```")[1]
+                          if raw.startswith("json"):
+                              raw = raw[4:]
+                      analysis = json.loads(raw.strip())
+                  except Exception as e:
+                      print(f"ERROR: {e}")
+                      continue
+
+                  item_id = str(uuid.uuid4())
+                  ts = datetime.now(timezone.utc).isoformat()
+                  dynamo.Table(TABLE).put_item(Item={
+                      "id": item_id,
+                      "timestamp": ts,
+                      "s3_key": key,
+                      "sentiment": analysis.get("sentiment","unknown"),
+                      "sentiment_score": str(analysis.get("sentiment_score",0)),
+                      "key_topics": analysis.get("key_topics",[]),
+                      "urgency_level": analysis.get("urgency_level","low"),
+                      "summary": analysis.get("summary",""),
+                      "action_required": analysis.get("action_required",False),
+                      "preview": content[:300]
+                  })
+
+                  sentiment = analysis.get("sentiment","neutral")
+                  urgency = analysis.get("urgency_level","low")
+                  if sentiment == "negative" or urgency in ("high","critical"):
+                      sns.publish(
+                          TopicArn=SNS_ARN,
+                          Subject=f"[Alert] {urgency.upper()} urgency review detected",
+                          Message=f"Sentiment: {sentiment}\nUrgency: {urgency}\nTopics: {', '.join(analysis.get('key_topics',[]))}\nSummary: {analysis.get('summary','')}\nFile: s3://{bucket}/{key}\nID: {item_id}"
+                      )
+              return {"statusCode":200}
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SentimentLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub "arn:aws:s3:::${ProjectName}-content-${AWS::AccountId}"
+
+  # ── CloudWatch Dashboard ────────────────────────────────────
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${ProjectName}-dashboard"
+      DashboardBody: !Sub |
+        {"widgets":[
+          {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"title":"Lambda Invocations","metrics":[["AWS/Lambda","Invocations","FunctionName","${SentimentLambda}"]],"period":300,"stat":"Sum"}},
+          {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"title":"Lambda Errors","metrics":[["AWS/Lambda","Errors","FunctionName","${SentimentLambda}"]],"period":300,"stat":"Sum"}}
+        ]}
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-errors"
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SentimentLambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [!Ref AlertTopic]
+      TreatMissingData: notBreaching
+
+Outputs:
+  BucketName:
+    Description: "Upload .txt review files here"
+    Value: !Ref ContentBucket
+  TableName:
+    Description: "DynamoDB results table"
+    Value: !Ref ResultsTable
+  LambdaName:
+    Description: "Lambda function"
+    Value: !Ref SentimentLambda
+  Dashboard:
+    Description: "CloudWatch dashboard"
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-dashboard"
