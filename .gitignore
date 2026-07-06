@@ -1,0 +1,42 @@
+# AWS credentials — NEVER commit these
+.aws/
+credentials
+*.pem
+*.key
+
+# Environment files
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+.Python
+venv/
+.venv/
+
+# Temp files
+*.tmp
+*.log
+/tmp/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Node (if any tooling added later)
+node_modules/
+
+# Output files
+*.zip
+results.json
+results.csv
